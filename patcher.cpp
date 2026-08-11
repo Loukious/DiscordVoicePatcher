@@ -7,6 +7,8 @@
 #include <vector>
 #include <map>
 #include <cstdint>
+#include <climits>
+#include <cstring>
 #include <algorithm>
 
 // ─── Types ─────────────────────────────────────────────────────
@@ -25,8 +27,22 @@ struct PatchEntry {
     int          alt_derive_offset = INT_MIN; // INT_MIN = not set
     std::vector<uint8_t> expected;
     std::vector<uint8_t> patch;
+    std::vector<uint8_t> alt_expected;
+    std::vector<uint8_t> alt_patch;
     uintptr_t    resolved_rva = 0;
 };
+
+struct PatchSnapshot {
+    std::string          name;
+    uintptr_t            module_base = 0;
+    uintptr_t            rva = 0;
+    std::vector<uint8_t> original;
+    std::vector<uint8_t> patched;
+};
+
+// Exact original bytes captured immediately before each successful write.
+// Keyed by absolute patch address so patches can be restored without rescanning.
+static std::map<uintptr_t, PatchSnapshot> g_snapshots;
 
 // ─── Helpers ───────────────────────────────────────────────────
 static std::string Trim(const std::string& s) {
@@ -80,6 +96,40 @@ static std::string HexStr(uintptr_t v) {
     return ss.str();
 }
 
+static bool IsAltTier(const std::string& tier) {
+    return tier == "alt" || tier == "derived-alt";
+}
+
+static const std::vector<uint8_t>& ExpectedForTier(const PatchEntry& e, const std::string& tier) {
+    if (IsAltTier(tier) && !e.alt_expected.empty()) return e.alt_expected;
+    return e.expected;
+}
+
+static const std::vector<uint8_t>& PatchForTier(const PatchEntry& e, const std::string& tier) {
+    if (IsAltTier(tier) && !e.alt_patch.empty()) return e.alt_patch;
+    return e.patch;
+}
+
+static bool BytesEqual(const uint8_t* site, const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) return true;
+    return std::memcmp(site, bytes.data(), bytes.size()) == 0;
+}
+
+static bool WriteBytes(uint8_t* site, const std::vector<uint8_t>& bytes) {
+    if (bytes.empty()) return false;
+
+    DWORD old_protect = 0;
+    if (!VirtualProtect(site, bytes.size(), PAGE_EXECUTE_READWRITE, &old_protect))
+        return false;
+
+    std::memcpy(site, bytes.data(), bytes.size());
+
+    DWORD ignored = 0;
+    VirtualProtect(site, bytes.size(), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), site, bytes.size());
+    return true;
+}
+
 // ─── INI Parser ────────────────────────────────────────────────
 static std::vector<PatchEntry> ParseIni(const std::string& path, std::string& err_out) {
     std::vector<PatchEntry> entries;
@@ -129,10 +179,16 @@ static std::vector<PatchEntry> ParseIni(const std::string& path, std::string& er
         if (kv.count("patch") && !kv["patch"].empty())
             e.patch = ParseHexBytes(kv["patch"]);
 
+        if (kv.count("alt_expected") && !kv["alt_expected"].empty())
+            e.alt_expected = ParseHexBytes(kv["alt_expected"]);
+
+        if (kv.count("alt_patch") && !kv["alt_patch"].empty())
+            e.alt_patch = ParseHexBytes(kv["alt_patch"]);
+
         bool has_pattern = !e.primary.bytes.empty();
         bool has_alt     = !e.alt.bytes.empty();
         bool has_derive  = !e.derive_from.empty();
-        bool has_patch   = !e.patch.empty();
+        bool has_patch   = !e.patch.empty() || !e.alt_patch.empty();
 
         if ((has_pattern || has_alt || has_derive) && has_patch)
             entries.push_back(e);
@@ -168,7 +224,6 @@ static uintptr_t SigScan(uint8_t* base, size_t size, const PatternData& p) {
     if (p.bytes.empty() || p.bytes.size() != p.mask.size()) return 0;
     size_t pat_len = p.bytes.size();
 
-    // Find first non-wildcard byte for fast initial search
     size_t first_fixed = SIZE_MAX;
     for (size_t i = 0; i < pat_len; i++)
         if (p.mask[i]) { first_fixed = i; break; }
@@ -196,34 +251,53 @@ static uintptr_t SigScan(uint8_t* base, size_t size, const PatternData& p) {
     return 0;
 }
 
+static bool VerifyExpectedAt(uint8_t* base, uintptr_t mod_size, uintptr_t rva,
+                             const std::vector<uint8_t>& expected) {
+    if (expected.empty()) return true;
+    if (rva >= mod_size || expected.size() > mod_size - rva) return false;
+    return BytesEqual(base + rva, expected);
+}
+
 // ─── Patch Application ─────────────────────────────────────────
 static std::string ApplyPatch(uint8_t* base, uintptr_t mod_size,
-                              const PatchEntry& e, std::string& tier_out) {
+                              const PatchEntry& e, const std::string& tier) {
     if (e.resolved_rva == 0)        return "not_resolved";
     if (e.resolved_rva >= mod_size) return "rva_out_of_bounds";
-    if (e.patch.empty())            return "no_patch_bytes";
+
+    const auto& expected = ExpectedForTier(e, tier);
+    const auto& patch = PatchForTier(e, tier);
+    if (patch.empty()) return "no_patch_bytes";
+
+    if (patch.size() > mod_size - e.resolved_rva)
+        return "patch_out_of_bounds";
+    if (!expected.empty() && expected.size() > mod_size - e.resolved_rva)
+        return "expected_out_of_bounds";
 
     uint8_t* site = base + e.resolved_rva;
-    size_t   len  = e.patch.size();
 
-    // Already patched?
-    bool already = true;
-    for (size_t i = 0; i < len; i++)
-        if (site[i] != e.patch[i]) { already = false; break; }
-    if (already) return "already_patched";
+    if (BytesEqual(site, patch))
+        return "already_patched";
 
-    // Verify expected bytes
-    if (!e.expected.empty()) {
-        for (size_t i = 0; i < e.expected.size(); i++)
-            if (site[i] != e.expected[i])
-                return "expected_mismatch";
+    if (!expected.empty() && !BytesEqual(site, expected))
+        return "expected_mismatch";
+
+    // Capture the complete original byte range, not only `expected`.
+    // This makes reversion exact even when expected is shorter than patch.
+    PatchSnapshot snapshot;
+    snapshot.name = e.name;
+    snapshot.module_base = reinterpret_cast<uintptr_t>(base);
+    snapshot.rva = e.resolved_rva;
+    snapshot.original.assign(site, site + patch.size());
+    snapshot.patched = patch;
+
+    const uintptr_t absolute_site = reinterpret_cast<uintptr_t>(site);
+    g_snapshots[absolute_site] = std::move(snapshot);
+
+    if (!WriteBytes(site, patch)) {
+        g_snapshots.erase(absolute_site);
+        return "write_failed";
     }
 
-    DWORD old;
-    VirtualProtect(site, len, PAGE_EXECUTE_READWRITE, &old);
-    memcpy(site, e.patch.data(), len);
-    VirtualProtect(site, len, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), site, len);
     return "ok";
 }
 
@@ -262,7 +336,6 @@ Napi::Object ApplyPatches(const Napi::CallbackInfo& info) {
     result.Set("module_base", Napi::String::New(env, HexStr((uintptr_t)base)));
     result.Set("module_size", Napi::String::New(env, HexStr(mod_size)));
 
-    // Build name→index map for derivation lookups
     std::map<std::string, size_t> name_idx;
     for (size_t i = 0; i < entries.size(); i++)
         name_idx[entries[i].name] = i;
@@ -292,35 +365,20 @@ Napi::Object ApplyPatches(const Napi::CallbackInfo& info) {
             uintptr_t anchor = entries[it->second].resolved_rva;
             if (anchor == 0) continue;
 
-            // Try primary derive_offset first
             intptr_t rva = (intptr_t)anchor + e.derive_offset;
-            if (rva > 0 && (uintptr_t)rva < mod_size) {
-                // Verify expected bytes if available
-                bool verified = true;
-                if (!e.expected.empty()) {
-                    for (size_t i = 0; i < e.expected.size(); i++)
-                        if (base[rva + i] != e.expected[i]) { verified = false; break; }
-                }
-                if (verified) {
-                    e.resolved_rva = (uintptr_t)rva;
-                    tiers[e.name] = "derived";
-                    continue;
-                }
+            if (rva > 0 && (uintptr_t)rva < mod_size &&
+                VerifyExpectedAt(base, mod_size, (uintptr_t)rva, ExpectedForTier(e, "derived"))) {
+                e.resolved_rva = (uintptr_t)rva;
+                tiers[e.name] = "derived";
+                continue;
             }
 
-            // Try alt_derive_offset if set
             if (e.alt_derive_offset != INT_MIN) {
                 intptr_t rva_alt = (intptr_t)anchor + e.alt_derive_offset;
-                if (rva_alt > 0 && (uintptr_t)rva_alt < mod_size) {
-                    bool verified = true;
-                    if (!e.expected.empty()) {
-                        for (size_t i = 0; i < e.expected.size(); i++)
-                            if (base[rva_alt + i] != e.expected[i]) { verified = false; break; }
-                    }
-                    if (verified) {
-                        e.resolved_rva = (uintptr_t)rva_alt;
-                        tiers[e.name] = "derived-alt";
-                    }
+                if (rva_alt > 0 && (uintptr_t)rva_alt < mod_size &&
+                    VerifyExpectedAt(base, mod_size, (uintptr_t)rva_alt, ExpectedForTier(e, "derived-alt"))) {
+                    e.resolved_rva = (uintptr_t)rva_alt;
+                    tiers[e.name] = "derived-alt";
                 }
             }
         }
@@ -338,12 +396,14 @@ Napi::Object ApplyPatches(const Napi::CallbackInfo& info) {
         if (e.resolved_rva)
             r.Set("rva", Napi::String::New(env, HexStr(e.resolved_rva)));
 
+        std::string tier;
         auto tier_it = tiers.find(e.name);
-        if (tier_it != tiers.end())
-            r.Set("tier", Napi::String::New(env, tier_it->second));
+        if (tier_it != tiers.end()) {
+            tier = tier_it->second;
+            r.Set("tier", Napi::String::New(env, tier));
+        }
 
-        std::string dummy;
-        std::string status = ApplyPatch(base, mod_size, e, dummy);
+        std::string status = ApplyPatch(base, mod_size, e, tier);
         r.Set("status", Napi::String::New(env, status));
 
         if      (status == "ok" || status == "already_patched") ok++;
@@ -357,11 +417,91 @@ Napi::Object ApplyPatches(const Napi::CallbackInfo& info) {
     result.Set("ok",      Napi::Number::New(env, ok));
     result.Set("failed",  Napi::Number::New(env, failed));
     result.Set("skipped", Napi::Number::New(env, skipped));
+    result.Set("tracked", Napi::Number::New(env, (double)g_snapshots.size()));
+    return result;
+}
+
+Napi::Object RevertPatches(const Napi::CallbackInfo& info) {
+    Napi::Env    env    = info.Env();
+    Napi::Object result = Napi::Object::New(env);
+
+    HMODULE hmod = GetModuleHandleW(L"discord_voice.node");
+    if (!hmod) {
+        result.Set("error", Napi::String::New(env, "discord_voice.node not found in process"));
+        return result;
+    }
+
+    MODULEINFO mi{};
+    GetModuleInformation(GetCurrentProcess(), hmod, &mi, sizeof(mi));
+    uint8_t*  base     = reinterpret_cast<uint8_t*>(hmod);
+    uintptr_t mod_size = mi.SizeOfImage;
+    uintptr_t module_base = reinterpret_cast<uintptr_t>(base);
+
+    result.Set("module_base", Napi::String::New(env, HexStr(module_base)));
+    result.Set("module_size", Napi::String::New(env, HexStr(mod_size)));
+    result.Set("tracked_before", Napi::Number::New(env, (double)g_snapshots.size()));
+
+    Napi::Array arr = Napi::Array::New(env);
+    uint32_t out_index = 0;
+    int ok = 0, failed = 0, skipped = 0;
+
+    for (auto it = g_snapshots.begin(); it != g_snapshots.end();) {
+        const PatchSnapshot snapshot = it->second;
+        Napi::Object r = Napi::Object::New(env);
+        r.Set("name", Napi::String::New(env, snapshot.name));
+        r.Set("rva", Napi::String::New(env, HexStr(snapshot.rva)));
+
+        std::string status;
+        bool erase_snapshot = false;
+
+        if (snapshot.module_base != module_base) {
+            status = "stale_module";
+            skipped++;
+            erase_snapshot = true;
+        } else if (snapshot.rva >= mod_size || snapshot.original.size() > mod_size - snapshot.rva) {
+            status = "rva_out_of_bounds";
+            failed++;
+        } else {
+            uint8_t* site = base + snapshot.rva;
+
+            if (BytesEqual(site, snapshot.original)) {
+                status = "already_reverted";
+                ok++;
+                erase_snapshot = true;
+            } else if (!BytesEqual(site, snapshot.patched)) {
+                // Do not overwrite bytes changed by somebody else after us.
+                status = "current_bytes_mismatch";
+                failed++;
+            } else if (!WriteBytes(site, snapshot.original)) {
+                status = "write_failed";
+                failed++;
+            } else {
+                status = "ok";
+                ok++;
+                erase_snapshot = true;
+            }
+        }
+
+        r.Set("status", Napi::String::New(env, status));
+        arr.Set(out_index++, r);
+
+        if (erase_snapshot)
+            it = g_snapshots.erase(it);
+        else
+            ++it;
+    }
+
+    result.Set("patches", arr);
+    result.Set("ok",      Napi::Number::New(env, ok));
+    result.Set("failed",  Napi::Number::New(env, failed));
+    result.Set("skipped", Napi::Number::New(env, skipped));
+    result.Set("tracked_after", Napi::Number::New(env, (double)g_snapshots.size()));
     return result;
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("applyPatches", Napi::Function::New(env, ApplyPatches));
+    exports.Set("revertPatches", Napi::Function::New(env, RevertPatches));
     return exports;
 }
 
